@@ -9,7 +9,7 @@ The script reads identity targets dynamically—either from a local users file o
 ## 🚀 Key Features
 
 * **Automated Initial Configuration Wizard:** Includes an interactive execution flag (`--setup`) to securely generate local ini targets without requiring text editors or template duplication.
-* **SBAC-Enforced Asset Group Filtering:** Queries the tenant database for active groups and strictly enforces pre-filtering matching `"IS_USED_BY_SBAC": true`. This completely prevents `400 Bad Request` schema rejections from the gateway by isolating scopeable buckets.
+* **SBAC-Enforced Asset Group Filtering:** Queries the tenant database for active groups and strictly enforces pre-filtering matching `"IS_USED_BY_SBAC": true`.
 * **Interactive Scope Query Engine:** Allows operators to pass a custom keyword string to filter through heavy asset group tables live instead of relying on rigid, hardcoded string mappings or manual integer ID entries.
 * **Multi-Source Ingestion Framework:** Provides a startup selector menu letting you choose between traditional local ingest pipelines (`users.csv`) or reading live, active personnel data feeds straight from the central `platform/iam/v1/user` account directory.
 * **Multi-Key Inventory Verification:** Scans the target tenant for *all* active keys registered under a user's specific comment envelope, ensuring multiple distinct access tokens are handled simultaneously.
@@ -26,7 +26,7 @@ Instead of manual string adjustments inside system files, you can initialize aut
 uv run Create_Api_Keys.py --setup
 ```
 
-This runs an execution environment loop to capture your parameters and cleanly write them to `API_config-x5.ini`:
+This runs an execution environment loop to capture your parameters and cleanly write them to `API_config.ini`:
 
 ```ini
 [URL]
