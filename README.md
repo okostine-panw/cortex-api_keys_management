@@ -53,8 +53,10 @@ Jane,Doe,Engineering,jdoe@example.com
 If leveraging the modern `uv` package manager, you can spin up the utility and dynamically inject all tracking and vault dependencies on-the-fly without dirtying your global system Python environment:
 
 ```bash
-uv run --with boto3 --with azure-keyvault-secrets --with azure-identity --with google-cloud-secret-manager --with pykeepass --with hvac Create_Api_Keys.py
+uv run --with boto3 --with azure-keyvault-secrets --with azure-identity --with google-cloud-secret-manager --with pykeepass --with hvac --with lastpass-python Create_Api_Keys.py
 ```
+
+> **Note:** Only include the `--with` flags for providers you actually plan to use. For LastPass, the `lastpass-python` SDK handles authentication validation, but write operations require the [LastPass CLI (`lpass`)](https://github.com/lastpass/lastpass-cli) to be installed and available on your PATH.
 
 ---
 
@@ -90,10 +92,36 @@ The script maintains a reordered deployment index. Enter selections `0` through 
 | **6** | Doppler SecretOps Control | Bearer Service Tokens, Project names, and Configuration environment labels. |
 | **7** | KeePass Database (`.kdbx`) | Path destination references and explicit, **non-empty master passwords**. |
 | **8** | 1Password Secrets Automation | Local Connect Server API gateway URL streams and matching vault UUIDs. |
+| **9** | LastPass Vault | Account email address and master password. Uses `lpass` CLI for vault writes. |
+
+### 5. Persistent Storage Configuration
+
+After selecting and configuring a storage provider, the script offers to **save your settings** to `.cortex_keys.config` for reuse on future runs:
+
+```
+Save storage configuration for future runs? (y/N): y
+Also save vault password/token to config file? (y/N): n
+[+] Storage configuration saved to .cortex_keys.config
+```
+
+On subsequent runs (when no `--storage-choice` CLI argument is provided), the script detects the saved configuration and offers to reuse it:
+
+```
+--- Saved Storage Configuration Found ---
+  Provider     : keepass
+  Target       : cortex_keys.kdbx
+  Prefix       : Cortex Keys
+  Password     : (not saved - will prompt)
+Use saved storage configuration? (Y/n):
+```
+
+* Sensitive fields (passwords/tokens) are **opt-in** for disk persistence — you choose whether to save them or be prompted each run.
+* CLI arguments (`--storage-choice`, `--vault-*`) always override saved configuration.
+* The saved config is stored in the `[STORAGE]` section of `.cortex_keys.config`.
 
 ---
 
-### 5. Script usage
+### 6. Script usage
 Example script run:
 ```bash
  uv run --with pykeepass Create_Api_Keys.py
@@ -141,7 +169,8 @@ Enter chosen user numbers (comma-separated, e.g., 1, 2) or 'ALL': 1
 6. Doppler SecretOps Control
 7. KeePass Database (.kdbx)
 8. 1Password Secrets Automation
-Select Storage Provider (0-8, Default: 0): 7
+9. LastPass Vault
+Select Storage Provider (0-9, Default: 0): 7
 KeePass Path (Default: cortex_keys.kdbx):
 Enter KeePass Master Password: 1234
 Group Name (Default: Cortex Keys):

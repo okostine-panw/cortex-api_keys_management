@@ -2,6 +2,8 @@ import configparser
 import csv
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import requests
@@ -48,12 +50,18 @@ try:
 except ImportError:
     INFISICAL_AVAILABLE = False
 
+try:
+    import lastpass
+    LASTPASS_AVAILABLE = True
+except ImportError:
+    LASTPASS_AVAILABLE = False
+
 # ==============================================================================
 # REPOSITORY CONFIGURATION
 # ==============================================================================
-API_CONFIG_PATH = 'API_config.ini'
-# SSL_VERIFY = False
-SSL_VERIFY = True
+API_CONFIG_PATH = 'API_config-x5.ini'
+SSL_VERIFY = False
+# SSL_VERIFY = True
 
 
 def read_api_config():
@@ -63,7 +71,14 @@ def read_api_config():
     Returns:
         tuple: A triplet containing the BaseURL, ACCESS_KEY_ID, and SECRET_KEY.
     """
-    config_path = '.cortex_keys.config' if os.path.exists('.cortex_keys.config') else API_CONFIG_PATH
+    # Prefer .cortex_keys.config only if it contains the [URL] section with credentials
+    config_path = API_CONFIG_PATH
+    if os.path.exists('.cortex_keys.config'):
+        test_config = configparser.ConfigParser()
+        test_config.read('.cortex_keys.config')
+        if test_config.has_section('URL'):
+            config_path = '.cortex_keys.config'
+
     config = configparser.ConfigParser()
     config.read(config_path)
     try:
@@ -74,6 +89,78 @@ def read_api_config():
     except (configparser.NoSectionError, configparser.NoOptionError) as err:
         print(f"[-] Configuration Error: Could not parse {config_path}. Details: {err}")
         sys.exit(1)
+
+
+def load_storage_config(config_path='.cortex_keys.config'):
+    """
+    Reads the [STORAGE] section from the local INI configuration file and returns
+    the saved storage provider settings as a dictionary.
+
+    Args:
+        config_path (str): Path to the INI configuration file.
+
+    Returns:
+        dict or None: A dictionary of storage configuration values, or None if the
+        file does not exist, the [STORAGE] section is missing, or a parse error occurs.
+    """
+    if not os.path.exists(config_path):
+        return None
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_path)
+        if not config.has_section('STORAGE'):
+            return None
+        return {
+            'provider': config.get('STORAGE', 'provider', fallback=''),
+            'target': config.get('STORAGE', 'vault_target', fallback=''),
+            'prefix': config.get('STORAGE', 'vault_prefix', fallback=''),
+            'password': config.get('STORAGE', 'vault_password', fallback=''),
+            'mount': config.get('STORAGE', 'vault_mount', fallback=''),
+            'env': config.get('STORAGE', 'vault_env', fallback=''),
+            'client_id': config.get('STORAGE', 'vault_client_id', fallback=''),
+        }
+    except (configparser.Error) as err:
+        print(f"[!] Warning: Could not parse storage config from {config_path}. Details: {err}")
+        return None
+
+
+def save_storage_config(target_config, config_path='.cortex_keys.config', include_password=False):
+    """
+    Writes the [STORAGE] section to the config file, preserving existing sections.
+
+    Reads the existing INI file to retain [URL] and [AUTHENTICATION] sections, then
+    overwrites the [STORAGE] section with the provided target_config values.
+
+    Args:
+        target_config (dict): The provider config dict to persist. Expected keys:
+            provider, target, prefix, password, mount, env, client_id.
+        config_path (str): Path to the INI configuration file.
+        include_password (bool): Whether to include the sensitive vault_password field.
+    """
+    config = configparser.ConfigParser()
+    config.read(config_path)
+
+    config.remove_section('STORAGE')
+    config.add_section('STORAGE')
+
+    config.set('STORAGE', 'provider', target_config['provider'])
+    config.set('STORAGE', 'vault_target', target_config['target'])
+    config.set('STORAGE', 'vault_prefix', target_config['prefix'])
+    config.set('STORAGE', 'vault_mount', target_config.get('mount', ''))
+    config.set('STORAGE', 'vault_env', target_config.get('env', ''))
+    config.set('STORAGE', 'vault_client_id', target_config.get('client_id', ''))
+
+    if include_password:
+        config.set('STORAGE', 'vault_password', target_config['password'])
+    else:
+        config.set('STORAGE', 'vault_password', '')
+
+    try:
+        with open(config_path, 'w') as config_file:
+            config.write(config_file)
+    except (IOError, OSError) as error:
+        print(f"[!] Warning: Could not save storage configuration: {error}")
 
 
 class CortexBulkKeyProvisioner:
@@ -253,7 +340,7 @@ class CortexBulkKeyProvisioner:
             payload["request_data"]["expiration"] = expiration_ms
 
         try:
-            response = requests.post(url, headers=self._get_headers(), json=payload, verify=SSL_VERIFY, timeout=15)
+            response = requests.post(url, headers=self._get_headers(), json=payload, verify=SSL_VERIFY, timeout=90)
             response.raise_for_status()
             res_json = response.json()
             reply = res_json.get("reply", {})
@@ -480,6 +567,85 @@ def store_in_onepassword(connect_url, token, vault_id, item_title, base_name, pa
         return f"1Password Error: {str(e)}"
 
 
+def store_in_lastpass(email, master_password, entry_name, payload):
+    """
+    Stores API key credentials as a LastPass vault entry using the lpass CLI.
+
+    The API key secret is stored in the Account's 'password' field.
+    Structured metadata is stored as formatted key-value text in the 'notes' field.
+
+    Args:
+        email: LastPass account email for authentication.
+        master_password: LastPass master password.
+        entry_name: Display name for the vault entry (e.g., "Cortex - John Smith").
+        payload: Dict with keys: CORTEX_API_KEY_ID, CORTEX_API_KEY, ROLE, DEPARTMENT, EMAIL, SYNC_DATE.
+
+    Returns:
+        str: Sync confirmation text or vault error details.
+    """
+    try:
+        # Attempt SDK authentication to validate credentials
+        try:
+            lastpass.Vault.open_remote(email, master_password)
+        except Exception as auth_err:
+            # SDK is read-only; if auth itself fails, report the error
+            err_msg = str(auth_err).lower()
+            if 'password' in err_msg or 'authentication' in err_msg or 'unauthorized' in err_msg:
+                return f"LastPass Error: Authentication failed - {auth_err}"
+
+        # Verify LastPass CLI is available for write operations
+        if not shutil.which('lpass'):
+            return "LastPass Error: lpass CLI not found. Install the LastPass CLI to use this storage backend."
+
+        # Authenticate via CLI
+        login_proc = subprocess.run(
+            ['lpass', 'login', '--trust', email],
+            input=master_password + '\n',
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if login_proc.returncode != 0:
+            return f"LastPass Error: Authentication failed - {login_proc.stderr.strip()}"
+
+        # Construct structured notes from payload metadata (NOT the API key itself)
+        notes = (
+            f"CORTEX_API_KEY_ID: {payload['CORTEX_API_KEY_ID']}\n"
+            f"ROLE: {payload['ROLE']}\n"
+            f"DEPARTMENT: {payload['DEPARTMENT']}\n"
+            f"EMAIL: {payload['EMAIL']}\n"
+            f"SYNC_DATE: {payload['SYNC_DATE']}"
+        )
+
+        # Derive username from email (base portion before @)
+        username = email.split('@')[0]
+
+        # Build the entry content for lpass add (encoded fields format)
+        entry_content = (
+            f"Name: {entry_name}\n"
+            f"URL: https://cortex.paloaltonetworks.com\n"
+            f"Username: {username}\n"
+            f"Password: {payload['CORTEX_API_KEY']}\n"
+            f"Notes: {notes}"
+        )
+
+        # Create the entry via lpass CLI
+        add_proc = subprocess.run(
+            ['lpass', 'add', '--non-interactive', entry_name],
+            input=entry_content,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if add_proc.returncode != 0:
+            return f"LastPass Error: Failed to create entry - {add_proc.stderr.strip()}"
+
+        return "SUCCESS (LastPass)"
+
+    except Exception as e:
+        return f"LastPass Error: {str(e)}"
+
+
 def store_secret_payload(provider_config, base_name, payload):
     """
     Evaluates runtime selection parameters and forwards secret payloads to the requested vault engine.
@@ -518,6 +684,14 @@ def store_secret_payload(provider_config, base_name, payload):
     elif provider == 'onepassword':
         item_title = f"Cortex - {base_name.replace('_', ' ').title()}"
         return store_in_onepassword(provider_config['target'], provider_config['password'], provider_config['prefix'], item_title, base_name, payload)
+    elif provider == 'lastpass':
+        entry_title = f"Cortex - {base_name.replace('_', ' ').title()}"
+        return store_in_lastpass(
+            provider_config['target'],
+            provider_config['password'],
+            entry_title,
+            payload
+        )
     return "SKIPPED"
 
 
@@ -719,7 +893,7 @@ if __name__ == "__main__":
     parser.add_argument("--source-choice", choices=["1", "2"], help="User Ingestion Source: 1 (CSV), 2 (Platform User Directory).")
     parser.add_argument("--user-search", help="Search string to filter platform users.")
     parser.add_argument("--user-selection", help="Chosen user index selections (comma-separated) or 'ALL'.")
-    parser.add_argument("--storage-choice", choices=[str(i) for i in range(9)], help="Storage Provider selection index (0-8).")
+    parser.add_argument("--storage-choice", choices=[str(i) for i in range(10)], help="Storage Provider selection index (0-9).")
     parser.add_argument("--vault-target", help="Vault provider target location parameter (Region, URL, Path).")
     parser.add_argument("--vault-prefix", help="Vault provider secret prefix / path / directory / project ID.")
     parser.add_argument("--vault-password", help="Vault provider master token, password, or key parameter.")
@@ -884,85 +1058,145 @@ if __name__ == "__main__":
                 'dept': dept_val
             })
 
-    print("\n--- Key Storage Configuration ---")
-    print("0. Local Storage Only (No Cloud Vault)")
-    print("1. AWS Secrets Manager")
-    print("2. Azure Key Vault")
-    print("3. GCP Secret Manager")
-    print("4. HashiCorp Vault / OpenBao")
-    print("5. Infisical Secrets Platform")
-    print("6. Doppler SecretOps Control")
-    print("7. KeePass Database (.kdbx)")
-    print("8. 1Password Secrets Automation")
-    choice = args.storage_choice or input("Select Storage Provider (0-8, Default: 0): ").strip() or "0"
-
     target_config = {"provider": "none", "target": "", "prefix": "", "password": "", "env": "", "client_id": ""}
 
-    if choice == "1":
-        target_config.update({
-            "provider": "aws",
-            "target": args.vault_target or input("AWS Region (Default: us-east-1): ").strip() or "us-east-1",
-            "prefix": args.vault_prefix or input("Secret Path Prefix (Default: cortex/api_keys): ").strip() or "cortex/api_keys"
-        })
-    elif choice == "2":
-        target_config.update({
-            "provider": "azure",
-            "target": args.vault_target or input("Azure Key Vault URL: ").strip(),
-            "prefix": args.vault_prefix or input("Secret Prefix (Optional): ").strip()
-        })
-    elif choice == "3":
-        target_config.update({
-            "provider": "gcp",
-            "target": args.vault_target or input("GCP Project ID: ").strip(),
-            "prefix": args.vault_prefix or input("Secret Prefix (Optional): ").strip()
-        })
-    elif choice == "4":
-        if not HASHICORP_AVAILABLE:
-            print("[!] Aborted: 'hvac' missing. Run via: uv run --with hvac Create_Api_Keys.py"); sys.exit(1)
-        target_config.update({
-            "provider": "hashicorp",
-            "target": args.vault_target or input("Vault Server URL (e.g., http://127.0.0.1:8200): ").strip(),
-            "password": args.vault_password or input("Vault Token: ").strip(),
-            "mount": args.vault_mount or input("KV Engine Mount Point (Default: secret): ").strip() or "secret",
-            "prefix": args.vault_prefix or input("Secret Path Directory (Default: cortex): ").strip() or "cortex"
-        })
-    elif choice == "5":
-        if not INFISICAL_AVAILABLE:
-            print("[!] Aborted: 'infisical-sdk' missing. Run via: uv run --with infisicalsdk Create_Api_Keys.py"); sys.exit(1)
-        target_config.update({
-            "provider": "infisical",
-            "target": args.vault_target or input("Infisical Host FQDN (Default: https://app.infisical.com): ").strip() or "https://app.infisical.com",
-            "client_id": args.vault_client_id or input("Machine Identity Client ID: ").strip(),
-            "password": args.vault_password or input("Machine Identity Client Secret: ").strip(),
-            "prefix": args.vault_prefix or input("Project ID Link: ").strip(),
-            "env": args.vault_env or input("Environment Slug (Default: dev): ").strip() or "dev"
-        })
-    elif choice == "6":
-        target_config.update({
-            "provider": "doppler",
-            "password": args.vault_password or input("Doppler Service Token: ").strip(),
-            "prefix": args.vault_prefix or input("Doppler Project Name: ").strip(),
-            "env": args.vault_env or input("Doppler Configuration Name: ").strip()
-        })
-    elif choice == "7":
-        if not KEEPASS_AVAILABLE:
-            print("[!] Aborted: 'pykeepass' missing. Run via: uv run --with pykeepass Create_Api_Keys.py"); sys.exit(1)
-        target_config.update({
-            "provider": "keepass",
-            "target": args.vault_target or input("KeePass Path (Default: cortex_keys.kdbx): ").strip() or "cortex_keys.kdbx",
-            "password": args.vault_password or input("Enter KeePass Master Password: ").strip(),
-            "prefix": args.vault_prefix or input("Group Name (Default: Cortex Keys): ").strip() or "Cortex Keys"
-        })
-        if not target_config["password"]:
-            print("[!] Error: KeePass master password cannot be empty.")
-            sys.exit(1)
-    elif choice == "8":
-        target_config.update({
-            "provider": "onepassword",
-            "target": args.vault_target or input("1Password Connect Server API URL: ").strip(),
-            "password": args.vault_password or input("Connect Bearer Access Token: ").strip(),
-            "prefix": args.vault_prefix or input("Target Vault UUID: ").strip()
-        })
+    # --- Persistent Storage Configuration Load ---
+    saved_storage = load_storage_config()
+    use_saved_config = False
+    if saved_storage and saved_storage.get('provider') and saved_storage['provider'] != 'none' and not args.storage_choice:
+        print("\n--- Saved Storage Configuration Found ---")
+        print(f"  Provider     : {saved_storage['provider']}")
+        if saved_storage.get('target'):
+            print(f"  Target       : {saved_storage['target']}")
+        if saved_storage.get('prefix'):
+            print(f"  Prefix       : {saved_storage['prefix']}")
+        if saved_storage.get('mount'):
+            print(f"  Mount Point  : {saved_storage['mount']}")
+        if saved_storage.get('env'):
+            print(f"  Environment  : {saved_storage['env']}")
+        has_saved_password = bool(saved_storage.get('password'))
+        print(f"  Password     : {'(saved)' if has_saved_password else '(not saved - will prompt)'}")
+        reuse_choice = input("Use saved storage configuration? (Y/n): ").strip().lower()
+        if reuse_choice != 'n':
+            use_saved_config = True
+            target_config = {
+                "provider": saved_storage['provider'],
+                "target": saved_storage.get('target', ''),
+                "prefix": saved_storage.get('prefix', ''),
+                "password": saved_storage.get('password', ''),
+                "mount": saved_storage.get('mount', ''),
+                "env": saved_storage.get('env', ''),
+                "client_id": saved_storage.get('client_id', '')
+            }
+            # Prompt for password if not saved
+            if not target_config['password']:
+                target_config['password'] = input(f"Enter vault password/token for {target_config['provider']}: ").strip()
+
+    if not use_saved_config:
+        print("\n--- Key Storage Configuration ---")
+        print("0. Local Storage Only (No Cloud Vault)")
+        print("1. AWS Secrets Manager")
+        print("2. Azure Key Vault")
+        print("3. GCP Secret Manager")
+        print("4. HashiCorp Vault / OpenBao")
+        print("5. Infisical Secrets Platform")
+        print("6. Doppler SecretOps Control")
+        print("7. KeePass Database (.kdbx)")
+        print("8. 1Password Secrets Automation")
+        print("9. LastPass Vault")
+        choice = args.storage_choice or input("Select Storage Provider (0-9, Default: 0): ").strip() or "0"
+
+        if choice == "1":
+            target_config.update({
+                "provider": "aws",
+                "target": args.vault_target or input("AWS Region (Default: us-east-1): ").strip() or "us-east-1",
+                "prefix": args.vault_prefix or input("Secret Path Prefix (Default: cortex/api_keys): ").strip() or "cortex/api_keys"
+            })
+        elif choice == "2":
+            target_config.update({
+                "provider": "azure",
+                "target": args.vault_target or input("Azure Key Vault URL: ").strip(),
+                "prefix": args.vault_prefix or input("Secret Prefix (Optional): ").strip()
+            })
+        elif choice == "3":
+            target_config.update({
+                "provider": "gcp",
+                "target": args.vault_target or input("GCP Project ID: ").strip(),
+                "prefix": args.vault_prefix or input("Secret Prefix (Optional): ").strip()
+            })
+        elif choice == "4":
+            if not HASHICORP_AVAILABLE:
+                print("[!] Aborted: 'hvac' missing. Run via: uv run --with hvac Create_Api_Keys.py"); sys.exit(1)
+            target_config.update({
+                "provider": "hashicorp",
+                "target": args.vault_target or input("Vault Server URL (e.g., http://127.0.0.1:8200): ").strip(),
+                "password": args.vault_password or input("Vault Token: ").strip(),
+                "mount": args.vault_mount or input("KV Engine Mount Point (Default: secret): ").strip() or "secret",
+                "prefix": args.vault_prefix or input("Secret Path Directory (Default: cortex): ").strip() or "cortex"
+            })
+        elif choice == "5":
+            if not INFISICAL_AVAILABLE:
+                print("[!] Aborted: 'infisical-sdk' missing. Run via: uv run --with infisicalsdk Create_Api_Keys.py"); sys.exit(1)
+            target_config.update({
+                "provider": "infisical",
+                "target": args.vault_target or input("Infisical Host FQDN (Default: https://app.infisical.com): ").strip() or "https://app.infisical.com",
+                "client_id": args.vault_client_id or input("Machine Identity Client ID: ").strip(),
+                "password": args.vault_password or input("Machine Identity Client Secret: ").strip(),
+                "prefix": args.vault_prefix or input("Project ID Link: ").strip(),
+                "env": args.vault_env or input("Environment Slug (Default: dev): ").strip() or "dev"
+            })
+        elif choice == "6":
+            target_config.update({
+                "provider": "doppler",
+                "password": args.vault_password or input("Doppler Service Token: ").strip(),
+                "prefix": args.vault_prefix or input("Doppler Project Name: ").strip(),
+                "env": args.vault_env or input("Doppler Configuration Name: ").strip()
+            })
+        elif choice == "7":
+            if not KEEPASS_AVAILABLE:
+                print("[!] Aborted: 'pykeepass' missing. Run via: uv run --with pykeepass Create_Api_Keys.py"); sys.exit(1)
+            target_config.update({
+                "provider": "keepass",
+                "target": args.vault_target or input("KeePass Path (Default: cortex_keys.kdbx): ").strip() or "cortex_keys.kdbx",
+                "password": args.vault_password or input("Enter KeePass Master Password: ").strip(),
+                "prefix": args.vault_prefix or input("Group Name (Default: Cortex Keys): ").strip() or "Cortex Keys"
+            })
+            if not target_config["password"]:
+                print("[!] Error: KeePass master password cannot be empty.")
+                sys.exit(1)
+        elif choice == "8":
+            target_config.update({
+                "provider": "onepassword",
+                "target": args.vault_target or input("1Password Connect Server API URL: ").strip(),
+                "password": args.vault_password or input("Connect Bearer Access Token: ").strip(),
+                "prefix": args.vault_prefix or input("Target Vault UUID: ").strip()
+            })
+        elif choice == "9":
+            if not LASTPASS_AVAILABLE:
+                print("[!] Aborted: 'lastpass-python' missing. Run via: uv run --with lastpass-python Create_Api_Keys.py"); sys.exit(1)
+            target_config.update({
+                "provider": "lastpass",
+                "target": args.vault_target or input("LastPass Email Address: ").strip(),
+                "password": args.vault_password or input("LastPass Master Password: ").strip(),
+                "prefix": args.vault_prefix or input("Vault Group/Folder (Default: Cortex Keys): ").strip() or "Cortex Keys"
+            })
+            if not target_config["target"]:
+                print("[!] Error: LastPass email address cannot be empty.")
+                sys.exit(1)
+            if not target_config["password"]:
+                print("[!] Error: LastPass master password cannot be empty.")
+                sys.exit(1)
+
+    # --- Offer to save storage configuration ---
+    if not use_saved_config and target_config['provider'] != 'none':
+        save_config_choice = input("\nSave storage configuration for future runs? (y/N): ").strip().lower()
+        if save_config_choice == 'y':
+            include_pw = False
+            if target_config.get('password'):
+                save_pw_choice = input("Also save vault password/token to config file? (y/N): ").strip().lower()
+                include_pw = (save_pw_choice == 'y')
+            save_storage_config(target_config, include_password=include_pw)
+            print("[+] Storage configuration saved to .cortex_keys.config")
 
     if args.save_csv:
         save_local_csv = args.save_csv.lower() != 'n'
