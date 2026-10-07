@@ -206,6 +206,174 @@ Do you also want to save a local backup CSV ledger? (Y/n):
 [+] Processing run finished. Log ledger written out to: generated_developer_keys_20260625_113440.csv
 ```
 
+**Cortex intentionally restricts API key chaining and programmatic key generation using an API key**.  
+---
+
+Why You Get This Error
+
+```
+
+"err_extra": "An API Key created in a public API call cannot generate new API Keys"
+
+```
+
+In Cortex (Cortex XDR, Cortex XSIAM, and Cortex Cloud), the platform's Role-Based Access Control (RBAC) and security architecture enforce a strict security guardrail:
+
+* **No Key Amplification / Chaining**: An API key generated via a public API call (or used in automated API workflows) is explicitly blocked from calling endpoints that generate, mint, or issue new API keys.  
+* **Security & Persistence Prevention**: This constraint prevents automated scripts or compromised API keys from escalating privileges, creating persistent backdoor keys, or generating an unlimited chain of credentials if an API key is ever exposed.
+
+---
+
+Can API Key Management Be Automated?
+
+* ❌ **Programmatically Creating New API Keys via API**: **No**, you cannot use an existing API key to create or mint additional API keys via REST API endpoints.  
+* ✅ **Managing Existing Settings & Roles**: You **can** automate user roles, group assignments, and authentication settings via the public API endpoints (e.g., /public\_api/v1/rbac/set\_user\_role, /public\_api/v1/rbac/get\_roles, /public\_api/v1/authentication-settings/create) using an API key assigned the **Instance Administrator** role.
+
+---
+
+Recommended Workarounds & Best Practices
+
+* **Generate Keys Interactively in the Console**:  
+  * Initial API keys must be created via an interactive administrator session in the UI under **Settings → Configurations → Integrations → API Keys** (or via **Cortex Gateway**).  
+* **Use Dedicated, Role-Scoped Keys**:  
+  * Create specific API keys for each integration or pipeline with only the minimum required RBAC permissions (e.g., standard key vs. advanced key with specific role assignments).  
+* **Manage Lifecycle via External Vaults**:  
+  * Store and manage the lifecycle of your generated Cortex API keys in an external credentials vault (such as HashiCorp Vault, AWS Secrets Manager, or CyberArk). Retrieve credentials from the vault within your automation scripts rather than attempting to generate new API keys from Cortex on the fly.  
+  * 
+
+---
+
+**Advanced API Keys** in Cortex (Cortex XDR, Cortex XSIAM, and Cortex Cloud) provide an extra layer of security for automated scripts by preventing replay attacks.  
+Instead of sending your raw secret API key over the wire, Advanced API keys require your script to dynamically generate a unique SHA-256 signature for **every request** using a **nonce** and a **timestamp**.  
+---
+
+How Advanced Request Signing Works
+
+* **Random Nonce**: Generate a 64-character random string (containing letters and digits) for the single request.  
+* **Timestamp**: Capture the current UTC timestamp in **milliseconds**.  
+* **SHA-256 Signature**: Concatenate the values in exact order: auth\_string \= API\_KEY \+ NONCE \+ TIMESTAMP and compute the SHA-256 hex digest.  
+* **HTTP Headers**: Pass the calculated hash in the Authorization header along with the metadata headers:  
+  * **x-xdr-auth-id**: Your API Key ID  
+  * **x-xdr-nonce**: The 64-character nonce used in the hash  
+  * **x-xdr-timestamp**: The timestamp in milliseconds  
+  * **Authorization**: The computed SHA-256 hash
+
+---
+
+Python 3 Implementation Example  
+Here is the complete Python script for authenticating against Cortex APIs using an Advanced API Key:
+
+```
+
+import hashlib
+import secrets
+import string
+from datetime import datetime, timezone
+import requests
+
+
+def make_advanced_api_call(
+    api_key_id: str, api_key: str, fqdn: str, endpoint_path: str, payload: dict
+):
+  # 1. Generate a 64-character random nonce
+  nonce = "".join(
+      secrets.choice(string.ascii_letters + string.digits) for _ in range(64)
+  )
+
+  # 2. Get the current UTC timestamp in milliseconds
+  timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+  # 3. Concatenate and calculate SHA-256 hash
+  auth_string = f"{api_key}{nonce}{timestamp}"
+  api_key_hash = hashlib.sha256(auth_string.encode("utf-8")).hexdigest()
+
+  # 4. Construct HTTP headers
+  headers = {
+      "x-xdr-auth-id": str(api_key_id),
+      "x-xdr-nonce": nonce,
+      "x-xdr-timestamp": str(timestamp),
+      "Authorization": api_key_hash,
+      "Content-Type": "application/json",
+  }
+
+  # 5. Execute API request
+  url = f"https://api-{fqdn}/public_api/v1/{endpoint_path}"
+  response = requests.post(url=url, headers=headers, json=payload)
+
+  return response
+
+```
+
+---
+
+Here are the **XQL queries** you can use in the Query Builder to audit API key activity, track key creations/modifications, and monitor public API requests in your tenant.  
+---
+
+1\. Audit API Key Management Events (Creation, Edits, Deletions)  
+To track who generated, updated, or revoked API keys, query the management audit log dataset:
+
+```
+
+dataset = audit_management_logs
+| filter AUDIT_ENTITY = "API Key" or AUDIT_ENTITY_SUBTYPE contains "API Key" or AUDIT_DESCRIPTION contains "API Key"
+| fields _time, AUDIT_OWNER_NAME, AUDIT_OWNER_EMAIL, AUDIT_ENTITY_SUBTYPE, AUDIT_DESCRIPTION, AUDIT_RESULT, AUDIT_SOURCE_IP, AUDIT_USER_AGENT
+| sort desc _time
+
+```
+
+* **AUDIT\_OWNER\_EMAIL**: The administrator who created or modified the API key.  
+* **AUDIT\_SOURCE\_IP**: The originating IP address where the management action took place.  
+* **AUDIT\_RESULT**: Indicates whether the action succeeded or failed.
+
+---
+
+2\. Audit Public API Request Volume & Key Usage (By API Key ID)  
+To see which specific API Key IDs (PAPI Key ID) are making calls, along with request volume and compute unit (CU) consumption:
+
+```
+
+dataset = correlations_auditing
+| filter PUBLIC_API = true
+| comp count() as total_api_calls by PAPI_KEY_ID, CREATED_BY
+| sort desc total_api_calls
+
+```
+
+Alternatively, to get a detailed breakdown of individual API calls by Key ID:
+
+```
+
+dataset = correlations_auditing
+| filter PUBLIC_API = true
+| fields _time, PAPI_KEY_ID, CREATED_BY, QUERY_DESCRIPTION, DURATION_SEC, NUM_OF_RESULTS, QUERY_STATUS
+| sort desc _time
+
+```
+
+---
+
+3\. Detect Failed API Authentication Attempts  
+To identify scripts or integrations attempting to make calls with invalid keys, expired tokens, or insufficient RBAC permissions:
+
+```
+
+dataset = audit_management_logs
+| filter AUDIT_RESULT = "FAIL" and (AUDIT_ENTITY = "AUTH" or AUDIT_DESCRIPTION contains "API")
+| fields _time, AUDIT_OWNER_EMAIL, AUDIT_DESCRIPTION, AUDIT_REASON, AUDIT_SOURCE_IP, AUDIT_USER_AGENT
+| sort desc _time
+
+```
+
+---
+
+In-Console Inspection Path  
+If you want to view these logs in the UI without XQL:
+
+* **Management Audit Trail**: Go to **Settings → Management Audit Logs** to review all key management actions.  
+* **API Key Usage Metrics**: Go to **Settings → Configurations → Data Management → Compute Unit Usage** to see per-key daily request counts and CU usage.
+
+
+
 ## 🔐 Vault Object Data Schema
 
 When committing credentials to cloud keychains or local password managers, the structured metadata is committed securely as a single stringified JSON document:
